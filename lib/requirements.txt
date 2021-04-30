@@ -1,0 +1,14 @@
+flask
+flask-sqlalchemy
+flask-login
+Flask-WTF
+py3-validate-email
+Flask-Mail
+
+Flask-Bcrypt
+Flask-DebugToolbar
+Flask-Migrate
+Flask-Testing
+Flask-Script
+email-validator
+coverage
