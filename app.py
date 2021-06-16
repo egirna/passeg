@@ -3,7 +3,7 @@ import os
 from flask import Flask, render_template, url_for, request, redirect, flash, Response, session
 import json
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func, exc
+from sqlalchemy import exc
 from datetime import datetime
 from flask_login import LoginManager, login_required, current_user, UserMixin, login_user, logout_user
 from lib.main_settings import *
@@ -11,24 +11,46 @@ import random
 from werkzeug.security import generate_password_hash, check_password_hash
 from validate_email import validate_email
 from itsdangerous import URLSafeTimedSerializer
-from flask_mail import Message, Mail
-from flask_bcrypt import Bcrypt
+#from flask_mail import Message, Mail
+#from flask_bcrypt import Bcrypt
+import re
+import rsa
+from Crypto.Cipher import AES
+from secrets import token_bytes
+
+
+success  = lambda resp: {'status':'success','data':resp}
+failure  = lambda resp: {'status':'failure','data':resp}
 
 
 
 app = Flask (__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///records.db'
 db = SQLAlchemy(app)
-mail = Mail(app)
-bcrypt = Bcrypt(app)
+#mail = Mail(app)
+#bcrypt = Bcrypt(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = '/'
-login_manager.login_message = "Login required"
-login_manager.login_message_category = "warning"
+#login_manager.login_message = {'status':'failure','data':"Login required"}
+#login_manager.login_message_category = "warning"
 app.config['SECRET_KEY'] = SECRET_KEY 
 app.config['SECURITY_PASSWORD_SALT'] = SECURITY_PASSWORD_SALT
 app.config['MAIL_DEFAULT_SENDER'] = MAIL_DEFAULT_SENDER
+
+
+@app.errorhandler(404)
+def not_found(error):
+        #return make_response(jsonify(failure('not found')), 404)
+        return failure("Not Found")
+
+
+@app.errorhandler(401)
+@login_manager.unauthorized_handler
+def unauthorized():
+        return failure("Login required")
+
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -38,6 +60,12 @@ def load_user(user_id):
 def generate_confirmation_token(username):
     serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
     return serializer.dumps(username, salt=app.config['SECURITY_PASSWORD_SALT'])
+
+
+def verify_email(username):
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", username):
+        return False
+    return True
 
 
 def confirm_token(token, expiration=3600):
@@ -61,6 +89,21 @@ def send_email(to, subject, template):
         )
         mail.send(msg)
 
+def encrypt(plainPassword, userKey):
+    cipher = AES.new(userKey, AES.MODE_EAX)
+    nonce = cipher.nonce
+    cipherPassword, tag= cipher.encrypt_and_digest(plainPassword.encode("ascii"))
+    return nonce, cipherPassword, tag
+
+def decrypt(nonce, cipherPassword, tag, userKey):
+    cipher = AES.new(userKey,  AES.MODE_EAX, nonce=nonce)
+    plainPassword = cipher.decrypt(cipherPassword)
+    try:
+
+        cipher.verify(tag)
+        return plainPassword.decode('ascii')
+    except ValueError:
+        return False
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -68,184 +111,725 @@ class User(UserMixin, db.Model):
     Username = db.Column(db.String(500), nullable= False, unique=True)
     Master_Password = db.Column(db.String(500), nullable=False)
     Confirmed = db.Column(db.Boolean, nullable=False, default=False)
-
-    def __repr__(self):
-        return ("User Created", "info")
-
-@app.route('/signup', methods=['POST','GET'])
-def sign_up():
-    if current_user.is_authenticated:
-        flash ("Logout to register a new user", "danger")
-        return redirect(url_for('login'))
-    if request.method == 'POST':
-        name = request.form['Name']
-        username = request.form['Username']
-        password = request.form['Password']
-        if len(username) == 0 or len(password) == 0:
-            return "Inproper username or password"
-        username = func.lower(username)
-        if User.query.filter_by(Username = username).first():
-            flash("This username already exists", "danger")
-            return redirect (url_for('sign_up'))
-
-        new_user = User(Name = name, Username = username, Master_Password = generate_password_hash(password, method='sha256'), Confirmed = False)
-        #try:
-        db.session.add(new_user)
-        db.session.commit()
-        flash("Registeration completed", "info")
-        return redirect('/')
-        '''
-        token = generate_confirmation_token(request.form['Username'])
-#        try:
-        confirm_url = url_for('confirm_email', token=token, _external=True)
-#        except werkzeug.routing.BuildError:
-#            return token
-        html = render_template('activate.html', confirm_url=confirm_url)
-        subject = "Please confirm your email"
-        send_email(username, subject, html)
-        login_user(new_user)
-        flash('A confirmation email has been sent via email.', 'success')
-
-        return redirect('/')
-        #except:
-        #    return "There was an issue signing up"
-        '''
-    else:
-        return render_template('signup.html')
-
+    UserKey = db.Column(db.String(1000), nullable=False, unique=True)
+    PublicKey = db.Column(db.String(1000), nullable=False, unique=True)
+    PrivateKey = db.Column(db.String(1000), nullable=False, unique=True)
+    date_created = db.Column(db.DateTime, default=datetime.utcnow)
+    date_modified = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Record(UserMixin, db.Model):
-    Id = db.Column(db.Integer, primary_key=True)
-    Owner_Id = db.Column(db.Integer, nullable=False)
+    id = db.Column(db.Integer, primary_key=True)
+    Owner_Id = db.Column(db.PickleType, nullable=False)
     AccountType = db.Column(db.String(10), nullable=False)
     Name = db.Column(db.String(200), nullable= True)
     Username = db.Column(db.String(500), nullable= False)
     Password = db.Column(db.String(500), nullable= False)
+    Nonce = db.Column(db.String(500), nullable = False)
+    Tag = db.Column(db.String(500), nullable = False)
+    Creator_Id = db.Column(db.Integer, nullable = False)
+    date_created = db.Column(db.DateTime, default=datetime.utcnow)
+    date_modified = db.Column(db.DateTime, default=datetime.utcnow)
+    shared_with = db.Column(db.PickleType, nullable= False)
+    shared_in = db.Column(db.PickleType)
+    modified_by = db.Column(db.PickleType, nullable=True)
+
+class Group(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), default="New Group")
+    members = db.Column(db.PickleType)
+    managers = db.Column(db.PickleType)
+    owners = db.Column(db.PickleType)
+    shared_passwords = db.Column(db.PickleType)
     date_created = db.Column(db.DateTime, default=datetime.utcnow)
     date_modified = db.Column(db.DateTime, default=datetime.utcnow)
 
-    def __repr__(self):
-        return ("Can't create password", "error")
-
-@app.route('/home', methods=['POST','GET'])
+@app.route('/deleteGroup/<int:groupId>', methods=['POST'])
 @login_required
-def index():
-    records = Record.query.order_by(Record.date_created).filter_by(Owner_Id=current_user.get_id())
-    return render_template('index.html', records=records)
+def deleteGroup(groupId):
+    currentUser = int(current_user.get_id())
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.owners:
+        return failure ("You are not an owner of this group")
+    if len(group.shared_passwords) != 0:
+        return failure ('This group is not empty')
+    try:
+        db.session.delete(group)
+        db.session.commit()
+        return success("Group deleted")
+    except:
+        return failure("An issue happened, please contact the developer")
 
-@app.route('/delete/<int:Id>')
+
+@app.route('/deletePasswordFromGroup/<int:passwordId>/<int:groupId>', methods=['POST'])
 @login_required
-def delete(Id):
-    password_to_delete = Record.query.get_or_404(Id)
+def deletePasswordFromGroup(passwordId, groupId):
+    currentUser = int(current_user.get_id())
+    password = Record.query.get(passwordId)
+    if not password:
+        return failure ("This password doesn't exist")
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.owners and currentUser not in group.managers:
+        return failure ("You are neither a manager nor an owner of this group")
+    if passwordId not in group.shared_passwords:
+        return failure ("This password is already not shared in this group")
+    passwords = list(group.shared_passwords)
+    passwords.remove(passwordId)
+    group.shared_passwords = passwords
+    shared_in = list(password.shared_in)
+    shared_in.remove(groupId)
+    password.shared_in = shared_in
+    try:
+        db.session.commit()
+        return success(group.shared_passwords)
+    except:
+        return failure("An issue happened, please contact the developer")
+
+
+@app.route('/revokeOwnerOfGroup/<int:ownerId>/<int:groupId>', methods=['POST'])
+@login_required
+def revokeOwnerOfGroup(ownerId, groupId):
+    currentUser = int(current_user.get_id())
+    owner = User.query.get(ownerId)
+    if not owner:
+        return failure ("This user doesn't exist")
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.owners:
+        return failure ("You are not an owner of this group")
+    if ownerId not in group.owners:
+        return failure ("This user is already not an owner in this group")
+    owners = list(group.owners)
+    owners.remove(ownerId)
+    if len(owners)==0:
+        return failure ("You're the only owner of this group")
+    group.owners = owners
+    try:
+        db.session.commit()
+        return success(group.owners)
+    except:
+        return failure("An issue happened, please contact the developer")
+
+
+@app.route('/revokeManagerOfGroup/<int:managerId>/<int:groupId>', methods=['POST'])
+@login_required
+def revokeManagerOfGroup(managerId, groupId):
+    currentUser = int(current_user.get_id())
+    manager = User.query.get(managerId)
+    if not manager:
+        return failure ("This manager doesn't exist")
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.managers and currentUser not in group.owners:
+        return failure ("You are nerither a manager nor an owner of this group")
+    if managerId not in group.managers:
+        return failure ("This user is already not a manager in this group")
+    if managerId in group.owners:
+        return failure ("Can't revoke manager from an owner")
+    managers = list(group.managers)
+    managers.remove(managerId)
+    group.managers = managers
+    try:
+        db.session.commit()
+        return success(group.managers)
+    except:
+        return failure("An issue happened, please contact the developer")
+
+
+@app.route('/deleteMemberFromGroup/<int:memberId>/<int:groupId>', methods=['POST'])
+@login_required
+def deleteMemberFromGroup(memberId, groupId):
+    currentUser = int(current_user.get_id())
+    user = User.query.get(memberId)
+    if not user:
+        return failure ("This user doesn't exist")
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.managers:
+        return failure ("You are not a manager of this group")
+    if memberId not in group.members:
+        return failure ("This user is already not a member in this group")
+    if memberId in group.owners and currentUser not in group.owners:
+        return failure ("A manager can't remove an owner from the group")
+    members = list(group.members)
+    members.remove(memberId)
+    group.members = members
+    try:
+        db.session.commit()
+        return success(group.members)
+    except:
+        return failure("An issue happened, please contact the developer")
+
+@app.route('/makeGroupOwner/<int:userId>/<int:groupId>', methods=['POST'])
+@login_required
+def makeGroupOwner(userId, groupId):
+    currentUser = int(current_user.get_id())
+    user = User.query.get(userId)
+    if not user:
+        return failure ("This user doesn't exist")
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.owners:
+        return failure ("You are not an owner of this group")
+    owners = list(group.owners)
+    managers = list(group.managers)
+    if userId not in group.members:
+        return failure ("This user is not a member in this group")
+    if userId in owners:
+        return failure ("This user is already an owner in this group")
+    managers.append(userId)
+    owners.append(userId)
+    group.managers = managers
+    group.owners = owners
+    try:
+        db.session.commit()
+        return success("This user is now an owner of the group")
+    except:
+        return failure("An issue happened, contact the developer")
+
+@app.route('/makeGroupManager/<int:userId>/<int:groupId>', methods=['POST'])
+@login_required
+def makeGroupManager(userId, groupId):
+    currentUser = int(current_user.get_id())
+    user = User.query.get(userId)
+    if not user:
+        return failure ("This user doesn't exist")
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    if currentUser not in group.owners:
+        return failure ("You are not an owner of this group")
+    managers = list(group.managers)
+    if userId not in group.members:
+        return failure ("This user is not a member in this group")
+    if userId in managers:
+        return failure ("This user is already a manager in this group")
+    managers.append(userId)
+    group.managers = managers
+    try:
+        db.session.commit()
+        return success("This user is now a manager of the group")
+    except:
+        return failure("An issue happened, contact the developer")
+
+@app.route('/addPasswordToGroup/<int:passwordId>/<int:groupId>', methods=['POST'])
+@login_required
+def addPasswordToGroup(passwordId, groupId):
+    group = Group.query.get(groupId)
+    currentUser = int(current_user.get_id())
+    if not group:
+        return failure ("This group doesn't exist")
+    password = Record.query.get(passwordId)
+    if not password:
+        return failure ("This password doesn't exist")
+    if currentUser not in group.members:
+        return failure ("You are not a member in this group")
+    if currentUser not in group.managers:
+        return failure ("You are not a manager in this group")
+    passwords = list(group.shared_passwords)
+    if passwordId in passwords:
+        return failure ("This password is already in this group")
+    passwords.append(passwordId)
+    group.shared_passwords = passwords
+    shared_in = list(password.shared_in)
+    shared_in.append(groupId)
+    password.shared_in = shared_in
+    try:
+        db.session.commit()
+        return success ("Password has been added to the group")
+    except:
+        return failure ("An issue happened")
+
+
+
+@app.route('/addUserToGroup/<int:userId>/<int:groupId>', methods=['POST'])
+@login_required
+def addUserToGroup(userId, groupId):
+    currentUser = int(current_user.get_id())
+    group = Group.query.get(groupId)
+    if not group:
+        return failure ("This group doesn't exist")
+    user = User.query.get(userId)
+    if not user:
+        return failure ("This user doesn't exist")
+    if currentUser not in group.members:
+        return failure ("You are not a member in this group")
+    if currentUser not in group.managers:
+        return failure ("You are not a manager in this group")
+    members = list(group.members)
+    if userId in members:
+        return failure ("This user is already a member of this group")
+    members.append(userId)
+    group.members = members
+    try:
+        db.session.commit()
+        return success ("User has been added to the group")
+    except:
+        return failure ("An issue happened")
+
+
+
+
+@app.route('/createGroup', methods=['POST'])
+@login_required
+def createGroup():
+    data = request.json
+    if data:
+        name = data.get('Name')
+    members = [int(current_user.get_id())]
+    managers = [int(current_user.get_id())]
+    owners = [int(current_user.get_id())]
+    shared_passwords = []
+    try:
+        newGroup = Group(name = name, members = members, shared_passwords = shared_passwords, managers = managers, owners = owners)
+    except UnboundLocalError:
+        newGroup = Group(members = members, shared_passwords = shared_passwords, managers = managers, owners = owners)
+    try:
+        db.session.add(newGroup)
+        db.session.commit()
+        group = Group.query.order_by(Group.date_created.desc()).limit(1)[0]
+        return success ("Group created with id: "+str(group.id))
+    except:
+        return failure ("An issue happened")
+
+
+@app.route('/revokePasswordShare/<int:passwordId>/<int:userId>', methods=['POST'])
+@login_required
+def revokePasswordShare(passwordId, userId):
+    user = User.query.get(userId)
+    currentUser = int(current_user.get_id())
+    if not user:
+        return failure("User doesn't exist")
+    record = Record.query.get(passwordId)
+    if not record:
+        return failure("Record doesn't exists")
+    if currentUser not in record.Owner_Id:
+        return failure("You're not allowed to share this password")
+    shared_with = list(record.shared_with)
+    if userId == currentUser:
+        return failure ("You are an owner of this password")
+    if userId not in shared_with:
+        return failure ("This password is not even shared with this user")
+    shared_with.remove(userId)
+    record.shared_with = shared_with
+    try:
+        db.session.commit()
+        return success (record.shared_with)
+    except:
+        return failure("An error occured")
+
+
+@app.route('/revokePasswordOwner/<int:passwordId>/<int:userId>', methods=['POST'])
+@login_required
+def revokePasswordOwner(passwordId, userId):
+    user = User.query.get(userId)
+    if not user:
+        return failure("User doesn't exist")
+    record = Record.query.get(passwordId)
+    if not record:
+        return failure("Record doesn't exists")
+    if int(current_user.get_id()) not in record.Owner_Id:
+        return failure("You're not allowed to make a user owner of this password")
+    owners = list(record.Owner_Id)
+    try:
+        owners.remove(userId)
+        if len(owners) == 0:
+            return failure("You are the only owner of this password")
+    except ValueError:
+        return failure('This user is already not an owner of this password')
+    record.Owner_Id = owners
+    try:
+        db.session.commit()
+        return success (record.Owner_Id)
+    except:
+        return failure("An error occured")
+
+
+@app.route('/makePasswordOwner/<int:passwordId>/<int:userId>', methods=['POST'])
+@login_required
+def makePasswordOwner(passwordId, userId):
+    user = User.query.get(userId)
+    if not user:
+        return failure("User doesn't exist")
+    record = Record.query.get(passwordId)
+    if not record:
+        return failure("Record doesn't exists")
+    if int(current_user.get_id()) not in record.Owner_Id:
+        return failure("You're not allowed to make a user owner of this password")
+    owners = list(record.Owner_Id)
+    if userId in owners:
+        return failure ("This user is already an owner of this password")
+    owners.append(userId)
+    record.Owner_Id = owners
+    shared_with = list(record.shared_with)
+    shared_with.append(userId)
+    record.shared_with = list(set(shared_with))
+
+    try:
+        db.session.commit()
+        return success (record.Owner_Id)
+    except:
+        return failure("An error occured")
+
+
+@app.route('/sharePasswordWith/<int:passwordId>/<int:userId>', methods=['POST'])
+@login_required
+def sharePasswordWith(passwordId, userId):
+    user = User.query.get(userId)
+    if not user:
+        return failure("User doesn't exist")
+    record = Record.query.get(passwordId)
+    if not record:
+        return failure("Record doesn't exists")
+    if int(current_user.get_id()) not in record.Owner_Id:
+        return failure("You're not allowed to share this password")
+    shared_with = list(record.shared_with)
+    if userId in shared_with:
+        return failure ("This password is already shared with this user")
+    if userId in list(record.Owner_Id):
+        return failure ("This user is already an owner of this password")
+    shared_with.append(userId)
+    record.shared_with = shared_with
+    try:
+        db.session.commit()
+        return success (record.shared_with)
+    except:
+        return failure("An error occured")
+
+    
+
+@app.route('/getCurrentUser')
+@login_required
+def getCurrentUser():
+    return success(current_user.get_id())
+
+@app.route('/updateUser/<username>', methods = ['POST'])
+def updateUser(username):
+    data = request.json
+    newName = data.get('Name')
+    newUsername = data.get('Username')
+    password = data.get('Password')
+
+    userToEdit = User.query.filter_by(Username = username).first()
+    if not userToEdit:
+        return failure ("This user doesn't exist")
+    if check_password_hash(userToEdit.Master_Password, password):
+        if (not newUsername or userToEdit.Username == newUsername)and (not newName or userToEdit.Name == newName):
+            return failure ("No changes to apply")
+        if newUsername:
+            userToEdit.Username = newUsername
+        if newName:
+            userToEdit.Name = newName
+        try:
+            db.session.commit()
+            return success("User details modified successfully")
+        except exc.IntegrityError:
+            return failure ("This username already exists")
+    else:
+        return failure("Password is incorrect")
+
+
+@app.route('/changeUserPassword', methods=['POST'])
+@login_required
+def changeUserPassword():
+    currentUser = int(current_user.get_id())
+    data = request.json
+    try:
+        current_password = data.get('Current_Password')
+        new_password = data.get('New_Password')
+    except AttributeError:
+        return failure ("Wrong request format")
+    user = User.query.get(currentUser)
+    if check_password_hash(user.Master_Password, current_password):
+        newPasswordHash =  generate_password_hash(new_password, method='pbkdf2:sha256', salt_length=8)
+        if check_password_hash(user.Master_Password, new_password):
+            return failure ("No change to apply")
+
+        user.Master_Password = newPasswordHash
+        try:
+            db.session.commit()
+            return success ("Password has been changed successfully")
+        except:
+            return failure ("An issue occured, please contact the developer")
+    else:
+        return failure ("Incorrect password")
+
+
+@app.route('/signup', methods=['POST'])
+def signup():
+    if current_user.is_authenticated:
+        return failure("Logout to register a new user")
+    data = request.json
+    name = data.get('Name')
+    username = data.get('Username').lower()
+    #if len(username.split('@')) == 1 or len(username.split('@')[1].split('.')) ==1:
+    if not verify_email(username):
+        return failure ("Invalid username, example username: username@example.com")
+    password = data.get('Password')
+    try:
+        if len(username) == 0 or len(password) == 0:
+            return failure("Inproper username or password")
+    except TypeError:
+        return failure("Inproper username or password")
+    if User.query.filter_by(Username = username).first():
+        return failure('This username already exists')
+
+    publicKey, privateKey = rsa.newkeys(512)
+    userKey = token_bytes(16)
+
+    newUser = User(Name = name, Username = username, Master_Password = generate_password_hash(password, method='pbkdf2:sha256', salt_length=8), Confirmed = False, PublicKey = str(publicKey), PrivateKey = str(privateKey), UserKey = userKey)
+    db.session.add(newUser)
+    db.session.commit()
+    userId = User.query.filter_by(Username = username).first().id
+    if current_user.is_authenticated:
+        logout_user()
+
+    return success ("Registeration completed with ID: "+ str(userId))
+    '''
+    token = generate_confirmation_token(request.form['Username'])
+#        try:
+    confirm_url = url_for('confirm_email', token=token, _external=True)
+#        except werkzeug.routing.BuildError:
+#            return token
+    html = render_template('activate.html', confirm_url=confirm_url)
+    subject = "Please confirm your email"
+    send_email(username, subject, html)
+    login_user(new_user)
+
+    flash('A confirmation email has been sent via email.', 'success')
+
+    return redirect('/')
+    #except:
+    #    return "There was an issue signing up"
+    '''
+
+
+
+@app.route('/deletePassword/<int:id>', methods=['POST'])
+@login_required
+def deletePassword(id):
+    password_to_delete = Record.query.get_or_404(id)
+    if int(current_user.get_id()) not in password_to_delete.Owner_Id:
+        return failure ("You're not allowed to delete this password")
     try:
         db.session.delete(password_to_delete)
         db.session.commit()
-        return redirect('/home')
+        return success (id)
     except:
-        return 'There was a problem deleting this password'
+        return failure('There was a problem deleting this password')
 
-@app.route('/update/<int:Id>', methods=['GET', 'POST'])
+@app.route('/getPasswordId/<username>')
+def getPasswordId(username):
+    username = username.lower()
+    record = Record.query.filter_by(Username = username).first()
+    if record:
+        return success (record.id)
+    else:
+        return failure ("Password not found")
+
+@app.route('/getPasswords')
 @login_required
-def update(Id):
-    record_to_update = Record.query.get_or_404(Id)
+def getPasswords():
+    #records = Record.query.filter_by( any(Record.shared_with) = current_user.get_id())
+    #records = Record.query.filter(int(current_user.get_id()).in_([1])).all()
+    ##records = Record.query.filter(Record.Owner_Id.in_([current_user.get_id(),])).all()
+    records = []
+    allRecords = Record.query.all()
+    shared_in = []
+    currentUser = int(current_user.get_id())
+    for record in allRecords:
+        if currentUser in record.shared_with or currentUser in record.Owner_Id:
+            records.append(record)
+        shared_in = record.shared_in
+        for group in shared_in:
+            members = Group.query.get(group).members
+            if currentUser in members:
+                records.append(record)
+            managers = Group.query.get(group).managers
+            if currentUser in managers:
+                records.append(record)
+            owners = Group.query.get(group).owners
+            if currentUser in owners:
+                records.append(record)
+        records = list(set(records))
+
+        
+    #records = Record.query.filter_by(Record.shared_with.any_(shared_with = current_user.get_id()))
+    #records = Record.query.filter(Record.shared_with.has(current_user.get_id()))
+    recs = []
+    for record in records:
+        creatorKey = User.query.get(record.Creator_Id).UserKey
+        passwd = decrypt(record.Nonce, record.Password, record.Tag, creatorKey)
+        recs.append(str({"id":record.id, "Name":record.Name, "Username":record.Username, "Password":passwd, "Owner":record.Owner_Id, "Shared with":record.shared_with}))
+    ','.join(recs)
+    return success (recs)
+
+
+@app.route('/updatePassword/<int:id>', methods=['GET', 'POST'])
+@login_required
+def updatePassword(id):
+    record_to_update = Record.query.get_or_404(id)
+    currentUser = int(current_user.get_id())
+    if currentUser not in record_to_update.Owner_Id and currentUser not in record_to_update.shared_with:
+        return failure("You're not allowed to update this password")
     if request.method == 'POST':
-        record_to_update.AccountType = request.form['account']
-        record_to_update.Name = request.form['Name']
-        record_to_update.Username = request.form['Username']
-        record_to_update.Password = request.form['password']
+        data = request.json
+        name = data.get('Name')
+        username = data.get('Username')
+        password = data.get('Password')
+        if (not name and not username and not password) or (record_to_update.Name == name and record_to_update.Username == username.lower() and record_to_update.Password==password):
+            return failure ("No change to apply")
+        if name:
+            record_to_update.Name = name
+        if not verify_email(username):
+            return failure ("Invalid username, example username: username@example.com")
+        if username:
+            record_to_update.Username = username.lower()
+        if password:
+            record_to_update.Password = password
         record_to_update.date_modified = datetime.utcnow()
         try:
             db.session.commit()
-            return redirect('/home')
+            return success("Password has been updated successfully")
         except:
-            return "There was a problem updating this password"
+            return failure ("There was a problem updating this password")
     else:
-        return render_template('update.html', record=record_to_update)
+        return success ("Password exists")
 
-@app.route('/clipboard.min.js')
-def js():
-    return render_template('clipboard.min.js')
-
-@app.route('/add', methods=['GET','POST'])
+@app.route('/getPassword/<int:id>')
 @login_required
-def add():
-    if request.method == 'POST':
+def getPassword(id):
+    password = Record.query.get_or_404(id)
+    if not password:
+        return failure("Password not found")
+    currentUser = int(current_user.get_id())
+    if not currentUser in password.Owner_Id and not currentUser in password.shared_with:
+        return failure ("You don't have access to this password")
+    creatorKey = User.query.get(password.Creator_Id).UserKey
+    passwd = decrypt(password.Nonce, password.Password, password.Tag, creatorKey)
+    return {"status":"success", "Name":password.Name, "Username":password.Username, "Password":passwd, "Shared with":password.shared_with, "Owners":password.Owner_Id,"Creator":password.Creator_Id}
 
-        accountType = request.form['account']
-        name = request.form['name']
-        username = func.lower(request.form['username'])
-        password = request.form['password']
-        if request.form['username'] == None or password == None:
-            alert("Username and password can't be empty", 'danger')
-            return redirect(url_for(add))
-        Owner_Id = current_user.get_id()
-        new_record = Record(AccountType = accountType, Name=name, Username=username, Password=password, Owner_Id=Owner_Id)
-        try:
-            db.session.add(new_record)
-            db.session.commit()
-            return redirect('/home')
-        except:
-            return 'There was an issue adding the new password'
-    else:
-        return render_template('add.html')
-
-@app.route('/', methods=['POST'])
-def signin_post():
-    username = func.lower(request.form['Username'])
-    password = request.form['Password']
-    user = User.query.filter_by(Username = username).first()
-    #try:
-    if not user or not check_password_hash(user.Master_Password, password):
-        flash('Invalid username or password', 'danger')
-        return redirect(url_for('login'))
-
-    login_user(user)
-    if user.Name:
-        session['current_username']='Welcome '+user.Name+'!'
-    else:
-        session['current_username']='Welcome '+user.Username+'!'
-
-    return redirect(url_for('index'))
-    """ 
+@app.route('/changeRecordPassword/<int:recordId>', methods=['POST'])
+@login_required
+def changeRecordPassword(recordId):
+    data = request.json
+    currentUser = int(current_user.get_id())
+    record = Record.query.get(recordId)
+    if not record:
+        return failure ("This record doesn't exist")
+    can_change = False
+    if currentUser in record.Owner_Id:
+        can_change = True
+    for i in record.shared_in:
+        group = Group.query.get(i)
+        for j in group.owners:
+            if currentUser == j:
+                can_change = True
+    if not can_change:
+        return failure ("You're not allowed to change this record")
+    try:
+        current_password = data.get('Current_Password')
+        new_password = data.get('New_Password')
     except AttributeError:
-        flash('Invalid username or password', 'Error!')
-        return redirect(url_for('login'))
-    """
-"""    
-@LoginManager.unauthorized_handler
-def unauthorized():
-    flash ('Login required', 'error')
-    return a_response
-"""
-@app.route('/')
-def login():
-    return render_template('signin.html')
+        return failure ("Wrong request format")
+    nonce = record.Nonce
+    tag = record.Tag
+    creator_key = User.query.get(record.Creator_Id).UserKey
 
-@app.route('/about')
-def about():
-    return 'Developed by Egirna Technologies'
+    if current_password != decrypt(nonce, record.Password, tag, creator_key):
+        return failure ("Incorrect password")
 
-@app.route('/details/<int:Id>')
+    elif new_password == decrypt(nonce, record.Password, tag, creator_key):
+        return failure ("No changes to apply")
+    newNonce, newCipherPassword, newTag = encrypt(new_password, creator_key)
+    record.date_modified = datetime.utcnow()
+    record.Nonce = newNonce
+    record.Password = newCipherPassword
+    record.Tag = newTag
+    modified_by = list(record.modified_by)
+    modified_by.append(currentUser)
+    record.modified_by = modified_by
+    try:
+        db.session.commit()
+        return success ("Password has been updated successfully")
+    except:
+        return faulure ("An issue occured, please contact the developer")
+
+    
+
+@app.route('/addPassword', methods=['POST'])
 @login_required
-def details(Id):
-    record_to_update = Record.query.get_or_404(Id)
-    return render_template('details.html', record = record_to_update)
+def addPassword():
+    data = request.json
+    name = data.get('Name')
+    username = data.get('Username').lower()
+    if not verify_email(username):
+        return failure ("Invalid username, example username: username@example.com")
+    password = data.get("Password")
+    if data.get('Username') == None or password == None:
+        return failure ("Username and password can't be empty")
+    records = Record.query.filter_by(Username = username).all()
+    if records:
+        for record in records:
+            if int(current_user.get_id()) in record.Owner_Id:
+                return failure ("This username already exists")
+    currentUser = int(current_user.get_id())
+    userKey = User.query.get(currentUser).UserKey
+    Owner_Id = []
+    Owner_Id.append(currentUser)
+    shared_with = []
+    shared_in = []
+    nonce, cipherPassword, tag = encrypt(password, userKey)
+    modified_by = []
+    
+    new_record = Record(Name=name, Username=username, Password=cipherPassword, Owner_Id=Owner_Id, AccountType = 'Personal', shared_with = shared_with, Nonce = nonce, Tag = tag, Creator_Id = currentUser, modified_by = modified_by, shared_in = shared_in)
+    try:
+        db.session.add(new_record)
+        db.session.commit()
+        passwords = Record.query.filter_by(Username = username).all()
+        ids = []
+        for password in passwords:
+            ids.append(password.id)
 
-@app.route('/random')
-def randomGen():
+        return success (ids)
+    except:
+        return failure ('There was an issue adding the new password')
+
+@app.route('/login', methods=['POST'])
+def login():
+    if current_user.is_authenticated:
+        return failure ("Already logged in: "+current_user.get_id())
+    data = request.json
+    username = data.get('Username').lower()
+    password = data.get('Password')
+    user = User.query.filter_by(Username = username).first()
+    if not user or not check_password_hash(user.Master_Password, password):
+        return failure('Invalid username or password')
+    login_user(user)
+    return success ("Logged in successfully: "+str(user.id))
+
+@app.route('/generateRandomPassword')
+def generateRandomPassword():
     chars = 'AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz!@#$%^&*()*/-+.1234567890{}]['
     password = ''
     for c in range(16):
         password += random.choice(chars)
-    return {'password':password}
+    return success(password)
 
 @app.route('/logout')
-@login_required
 def logout():
-    logout_user()
-    flash ('Logged out', 'info')
-    session['current_username'] = ''
-    return redirect('/')
+    if current_user.is_authenticated:
+        logout_user()
+        return success ("Logged out successfully")
+    else:
+        return failure ("Login required")
 
 @app.route('/confirm/<token>')
 @login_required
@@ -265,4 +849,4 @@ def confirm_email(token):
         return redirect(url_for('index'))
 
 if __name__ == "__main__":
-    app.run (port = 8000,debug = True)
+    app.run (host = "0.0.0.0", port = 8000,debug = True)

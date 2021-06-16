@@ -12,3 +12,8 @@ Flask-Testing
 Flask-Script
 email-validator
 coverage
+
+PyCryptodome
+rsa
+validate_email
+requests
